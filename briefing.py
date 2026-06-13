@@ -262,7 +262,12 @@ def get_lookback() -> int:
     return 72 if datetime.now(KST).weekday() == 0 else 36
 
 def is_recent(pub_dt, cutoff) -> bool:
-    return pub_dt is None or pub_dt >= cutoff
+    if pub_dt is None:
+        return True
+    # timezone-naive → UTC로 간주
+    if pub_dt.tzinfo is None:
+        pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+    return pub_dt >= cutoff
 
 
 # ───────── 기사 수집 (키워드 필터링) ────────────────────────────
