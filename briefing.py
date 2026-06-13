@@ -22,7 +22,7 @@ from email.utils import parsedate_to_datetime
 BOT_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "").strip()
 # 1.5-flash / 2.0-flash 는 종료됨 → 기본값 2.5-flash (필요 시 환경변수로 변경)
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 CHAT_ID      = 645475613
 KST          = timezone(timedelta(hours=9))
 MAX_MSG      = 4000
@@ -285,10 +285,19 @@ def article_url(link: str, title: str) -> str:
 
 
 # ───────── Gemini 요약 ───────────────────────────────────────────
-def _call_gemini(prompt: str) -> str:
+# 2.5-flash 등은 기본적으로 'thinking'이 켜져 있어 출력 토큰을 추론에 소비 →
+# 요약이 중간에 잘리는 원인. thinkingBudget=0 으로 끄고 출력 토큰을 넉넉히 확보.
+# (thinkingConfig 미지원 모델이면 자동 비활성 후 재시도)
+_GEN_THINKING = {"enabled": True}
+
+
+def _call_gemini(prompt: str, retries: int = 1) -> str:
+    gen = {"maxOutputTokens": 1024, "temperature": 0.3}
+    if _GEN_THINKING["enabled"]:
+        gen["thinkingConfig"] = {"thinkingBudget": 0}
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"maxOutputTokens": 600, "temperature": 0.3},
+        "generationConfig": gen,
     }).encode("utf-8")
     req = urllib.request.Request(
         GEMINI_URL.format(model=GEMINI_MODEL, key=GEMINI_KEY),
@@ -298,24 +307,54 @@ def _call_gemini(prompt: str) -> str:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read())
-        return result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        cand  = (result.get("candidates") or [{}])[0]
+        parts = cand.get("content", {}).get("parts", []) or []
+        # 텍스트 파트만 결합(추론/기타 파트 제외)
+        return "".join(
+            p.get("text", "") for p in parts if isinstance(p, dict) and "text" in p
+        ).strip()
     except urllib.error.HTTPError as e:
-        print(f"  ⚠️ Gemini 오류: {e} → {e.read().decode()[:120]}", file=sys.stderr)
+        try:
+            msg = e.read().decode()[:200]
+        except Exception:
+            msg = ""
+        # thinkingConfig 미지원 → 비활성 후 1회 재시도
+        if _GEN_THINKING["enabled"] and ("thinking" in msg.lower() or e.code == 400):
+            _GEN_THINKING["enabled"] = False
+            if retries > 0:
+                return _call_gemini(prompt, retries - 1)
+        print(f"  ⚠️ Gemini 오류: {e} → {msg}", file=sys.stderr)
         return ""
     except Exception as e:
+        if retries > 0:
+            time.sleep(1.0)
+            return _call_gemini(prompt, retries - 1)
         print(f"  ⚠️ Gemini 오류: {e}", file=sys.stderr)
         return ""
 
 
+def _clip_sentence(s: str, n: int = 110) -> str:
+    """문장을 단어 경계에서 깔끔하게 자른다(중간에 잘리지 않도록)."""
+    s = s.strip()
+    if len(s) <= n:
+        return s
+    cut = s[:n]
+    sp = cut.rfind(" ")
+    if sp > n * 0.5:
+        cut = cut[:sp]
+    return cut.rstrip(" ,.·–-") + "…"
+
+
 def _fallback_summary(title: str, body: str) -> str:
-    """Gemini 미사용/실패 시: 본문 앞부분을 3개 문장으로 분할한 폴백 요약."""
+    """Gemini 미사용/실패 시: 본문 앞부분을 완결된 3개 문장으로 분할한 폴백 요약."""
     if not body:
         return ""
-    sents = re.split(r"(?<=[.。!?])\s+|(?<=다\.)\s*", body)
+    # 한국어 '~다.' 및 영어 문장부호 기준 분리
+    sents = re.split(r"(?<=다\.)\s*|(?<=[.!?])\s+", body)
     sents = [s.strip() for s in sents if len(s.strip()) > 15]
-    picked = sents[:3] if sents else [body[:120]]
+    picked = sents[:3] if sents else [body[:110]]
     marks = ["①", "②", "③"]
-    return "\n".join(f"{marks[i]} {s[:90]}" for i, s in enumerate(picked))
+    return "\n".join(f"{marks[i]} {_clip_sentence(s)}" for i, s in enumerate(picked))
 
 
 def summarize(title: str, body: str) -> str:
@@ -334,7 +373,7 @@ def summarize(title: str, body: str) -> str:
 
 [임무]
 위 기사 본문 전체를 읽고 핵심만 신문 소제목 스타일로 3문장 요약하세요.
-출력은 반드시 한국어입니다 (영문 기사도 한국어로 번역해 작성).
+출력은 반드시 한국어입니다. 해외(영문) 기사도 반드시 한국어로 번역·요약하세요. 영어 단어를 그대로 나열하지 마세요(고유명사·약어 제외).
 본문에 실제로 등장한 사실(수치·기업명·날짜·규모)만 사용하고, 본문에 없는 내용은 지어내지 마세요.
 
 [소제목 스타일]
@@ -343,7 +382,12 @@ def summarize(title: str, body: str) -> str:
 - ①: 핵심 사건/결정 (무슨 일이, 누가, 얼마 규모로)
 - ②: 배경·맥락 (왜 이 일이 일어났는지, 업계 트렌드)
 - ③: 파급효과·전망 (업계·투자자·정책에 미치는 영향)
-- 각 줄은 45자 이내로 간결하게
+- 각 줄은 40자 안팎으로 간결하게, 단 반드시 완결된 구(句)로 끝낼 것
+
+[문장 완결 — 매우 중요]
+- 세 줄 모두 의미가 끊기지 않는 완성된 문장/구로 작성
+- 말줄임표(…)나 미완성 형태로 끝내지 말 것
+- 문장이 길어질 것 같으면 내용을 줄여서라도 반드시 완결할 것
 
 [절대 금지]
 - 본문 문장 그대로 복사 또는 단어만 교체
@@ -368,6 +412,15 @@ def summarize(title: str, body: str) -> str:
 
     result = _call_gemini(prompt)
     if result and "①" in result:
+        # ①②③ 줄만 남기고 꼬리 말줄임표·잡음 정리
+        lines = []
+        for ln in result.splitlines():
+            ln = ln.strip()
+            if ln and ln[0] in "①②③":
+                ln = ln.rstrip(" .…")
+                lines.append(ln)
+        if len(lines) >= 3:
+            return "\n".join(lines[:3])
         return result
     return _fallback_summary(title, body)
 
@@ -384,58 +437,48 @@ def is_recent(pub_dt, cutoff) -> bool:
     return pub_dt >= cutoff
 
 
-# ───────── 기사 수집 (키워드 필터링) ────────────────────────────
-def collect_kr(cutoff) -> dict:
-    raw_all = []
-    for url in KR_FEEDS:
-        for title, pub_dt, body, link in fetch_rss(url):
-            if is_recent(pub_dt, cutoff):
-                raw_all.append((title, body, link))
+# ───────── 기사 수집 (전역 중복 제거 + 카테고리 우선순위) ────────
+def _dedup_key(title: str) -> str:
+    """제목 정규화 키: 소문자화 + 공백/기호 제거 후 앞 40자."""
+    return re.sub(r"[^0-9a-z가-힣]", "", (title or "").lower())[:40]
 
-    seen, deduped = set(), []
-    for item in raw_all:
-        k = item[0][:60]
-        if k not in seen:
-            seen.add(k)
-            deduped.append(item)
 
+def _categorize(txt: str, kw_map: dict):
+    """CATS 정의 순서대로 검사 → 가장 먼저 매칭되는 카테고리 1개만 반환."""
+    for cat in CATS:
+        if any(kw in txt for kw in kw_map[cat["key"]]):
+            return cat["key"]
+    return None
+
+
+def collect_feeds(feeds, kw_map, max_per, lower, cutoff, seen) -> dict:
+    """
+    피드 수집 → 전역 중복 제거(제목+링크, seen 공유) →
+    겹치는 기사는 CATS 순서상 가장 빠른 카테고리에만 1회 배정.
+    seen 은 국내·해외 호출 간 공유되어 브리핑 전체에서 중복을 제거한다.
+    """
     result = {cat["key"]: [] for cat in CATS}
-    for title, body, link in deduped:
-        txt = title + " " + body[:200]
-        for cat in CATS:
-            k = cat["key"]
-            if len(result[k]) >= MAX_KR:
-                continue
-            if any(kw in txt for kw in KR_KW[k]):
-                result[k].append((title, body, link))
-                break
-    return result
-
-
-def collect_intl(cutoff) -> dict:
-    raw_all = []
-    for url in INTL_FEEDS:
+    for url in feeds:
         for title, pub_dt, body, link in fetch_rss(url):
-            if is_recent(pub_dt, cutoff):
-                raw_all.append((title, body, link))
-
-    seen, deduped = set(), []
-    for item in raw_all:
-        k = item[0][:60]
-        if k not in seen:
-            seen.add(k)
-            deduped.append(item)
-
-    result = {cat["key"]: [] for cat in CATS}
-    for title, body, link in deduped:
-        txt = title.lower() + " " + body[:200].lower()
-        for cat in CATS:
-            k = cat["key"]
-            if len(result[k]) >= MAX_INTL:
+            if not is_recent(pub_dt, cutoff):
                 continue
-            if any(kw in txt for kw in INTL_KW[k]):
-                result[k].append((title, body, link))
-                break
+            tkey = _dedup_key(title)
+            lkey = (link or "").split("?")[0].rstrip("/")
+            # 이미 등장한 기사(제목 또는 링크 중복)는 건너뜀
+            if (tkey and tkey in seen) or (lkey and lkey in seen):
+                continue
+            if tkey:
+                seen.add(tkey)
+            if lkey:
+                seen.add(lkey)
+
+            txt = (title + " " + body[:200])
+            if lower:
+                txt = txt.lower()
+            cat = _categorize(txt, kw_map)
+            if cat is None or len(result[cat]) >= max_per:
+                continue
+            result[cat].append((title, body, link))
     return result
 
 
@@ -535,8 +578,11 @@ def main():
     cutoff   = datetime.now(timezone.utc) - timedelta(hours=lookback)
     print(f"  📅 조회 기간: 최근 {lookback}시간")
 
-    kr_raw   = collect_kr(cutoff)
-    intl_raw = collect_intl(cutoff)
+    # 국내·해외가 seen 을 공유 → 브리핑 전체에서 중복 기사 제거,
+    # 겹치는 기사는 가장 빠른 카테고리에만 배정
+    seen = set()
+    kr_raw   = collect_feeds(KR_FEEDS,   KR_KW,   MAX_KR,   False, cutoff, seen)
+    intl_raw = collect_feeds(INTL_FEEDS, INTL_KW, MAX_INTL, True,  cutoff, seen)
     print(f"  🇰🇷 국내: {sum(len(v) for v in kr_raw.values())}건")
     print(f"  🌐 해외: {sum(len(v) for v in intl_raw.values())}건")
 
