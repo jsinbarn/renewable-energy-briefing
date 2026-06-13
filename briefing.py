@@ -171,7 +171,7 @@ def build_message(categorized: dict, lookback_hours: int) -> str:
     period_note = "📌 주말 포함 3일치 뉴스" if lookback_hours == 72 else "📌 전일 기준 최신 뉴스"
 
     lines = [
-        "⚡ <b>재생에너지 모닝 브리핑</b>",
+        "⚡ 재생에너지 모닝 브리핑",
         f"📅 {date_str}",
         period_note,
         "━━━━━━━━━━━━━━━━━━",
@@ -180,7 +180,7 @@ def build_message(categorized: dict, lookback_hours: int) -> str:
 
     for cat in CATEGORIES:
         articles = categorized.get(cat["key"], [])
-        lines.append(f"<b>{cat['label']}</b>")
+        lines.append(cat['label'])
         if articles:
             for a in articles:
                 lines.append(f"• {html.escape(a)}")
@@ -190,7 +190,7 @@ def build_message(categorized: dict, lookback_hours: int) -> str:
 
     lines += [
         "━━━━━━━━━━━━━━━━━━",
-        "🌐 <i>CleanTechnica · Electrek · PV Magazine · REWorld · RechargeNews</i>",
+        "🌐 CleanTechnica · Electrek · PV Magazine · REWorld",
     ]
     return "\n".join(lines)
 
@@ -204,7 +204,6 @@ def send_telegram(message: str) -> bool:
     data = urllib.parse.urlencode({
         "chat_id":                  CHAT_ID,
         "text":                     message,
-        "parse_mode":               "HTML",
         "disable_web_page_preview": "true",
     }).encode()
 
