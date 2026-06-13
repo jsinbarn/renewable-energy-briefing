@@ -202,7 +202,7 @@ def send_telegram(message: str) -> bool:
         return False
 
     payload = json.dumps({
-        "chat_id": CHAT_ID,
+        "chat_id": int(CHAT_ID),
         "text":    message,
     }).encode("utf-8")
 
