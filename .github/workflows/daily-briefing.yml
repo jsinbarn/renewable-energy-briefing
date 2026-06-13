@@ -6,7 +6,10 @@ on:
     # 일~목 UTC = 월~금 KST → 평일 오전 8시 전송
     - cron: '0 23 * * 0,1,2,3,4'
   workflow_dispatch:   # GitHub 화면에서 수동 실행 버튼
-
+  
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  
 jobs:
   send-briefing:
     runs-on: ubuntu-latest
