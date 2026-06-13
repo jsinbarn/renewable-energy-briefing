@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 재생에너지 모닝 브리핑 - Telegram 자동 전송
-기사 요약 + 원문 링크 포함 / 국내 70% : 해외 30%
+Gemini 1.5 Flash로 기사별 3줄 한국어 요약 생성
+국내 70% : 해외 30% / 평일 오전 8시(KST) 실행
 """
 
 import os, re, sys, json, time
@@ -12,10 +13,11 @@ from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
 # ───────── 설정 ──────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID   = 645475613       # 텔레그램 개인 Chat ID
-KST       = timezone(timedelta(hours=9))
-MAX_MSG   = 4000            # 텔레그램 메시지 분할 기준 (최대 4096자)
+BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+CHAT_ID    = 645475613
+KST        = timezone(timedelta(hours=9))
+MAX_MSG    = 4000   # 텔레그램 메시지 분할 기준
 
 # ───────── 카테고리 ───────────────────────────────────────────────
 CATS = [
@@ -25,7 +27,7 @@ CATS = [
     {"key": "invest", "label": "💼 기업 & 투자"},
 ]
 
-# ───────── 국내 뉴스: Google News 한국어 RSS (카테고리별 검색) ────
+# ───────── 국내 뉴스: Google News 한국어 RSS ─────────────────────
 def _gnews(q: str) -> str:
     return "https://news.google.com/rss/search?" + urllib.parse.urlencode(
         {"q": q, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}
@@ -58,8 +60,8 @@ INTL_KW = {
                "billion", "million", "contract", "ppa", "project finance"],
 }
 
-MAX_KR   = 2    # 카테고리당 국내 최대
-MAX_INTL = 1    # 카테고리당 해외 최대
+MAX_KR   = 2
+MAX_INTL = 1
 
 
 # ───────── RSS 파싱 유틸 ─────────────────────────────────────────
@@ -67,17 +69,11 @@ def strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
 
-def clean_desc(raw: str, max_len: int = 130) -> str:
-    """HTML 제거 → 공백 정리 → 길이 제한"""
-    t = strip_tags(raw)
-    t = re.sub(r"\s+", " ", t).strip()
-    # Google News description은 보통 제목과 거의 동일 → 빈 처리
+def clean_desc(raw: str, max_len: int = 150) -> str:
+    t = re.sub(r"\s+", " ", strip_tags(raw)).strip()
     if len(t) < 20:
         return ""
-    if len(t) > max_len:
-        cut = t[:max_len].rsplit(" ", 1)[0]
-        return cut + "…"
-    return t
+    return t[:max_len].rsplit(" ", 1)[0] + "…" if len(t) > max_len else t
 
 
 def parse_date(s: str):
@@ -96,7 +92,7 @@ def parse_date(s: str):
 
 
 def fetch_rss(url: str):
-    """RSS URL → [(title, pub_dt, desc, link)] 반환"""
+    """RSS URL → [(title, pub_dt, desc, link)]"""
     try:
         req = urllib.request.Request(
             url,
@@ -105,7 +101,6 @@ def fetch_rss(url: str):
         with urllib.request.urlopen(req, timeout=15) as resp:
             raw = resp.read()
 
-        # 인코딩 자동 감지 (EUC-KR 등 한국 뉴스 사이트 대응)
         try:
             raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -118,11 +113,7 @@ def fetch_rss(url: str):
         for item in root.findall(".//item"):
             title = strip_tags(item.findtext("title", ""))
             desc  = item.findtext("description", "") or ""
-            link  = (
-                item.findtext("link", "")
-                or item.findtext("guid", "")
-                or ""
-            ).strip()
+            link  = (item.findtext("link", "") or item.findtext("guid", "") or "").strip()
             pub   = item.findtext("pubDate") or item.findtext(
                 "{http://purl.org/dc/elements/1.1/}date", ""
             )
@@ -135,6 +126,60 @@ def fetch_rss(url: str):
         return []
 
 
+# ───────── Gemini 3줄 요약 ───────────────────────────────────────
+GEMINI_URL = (
+    "https://generativelanguage.googleapis.com/v1beta"
+    "/models/gemini-1.5-flash:generateContent?key={key}"
+)
+
+def summarize(title: str, desc: str) -> str:
+    """
+    Gemini 1.5 Flash로 기사 3줄 한국어 요약 생성.
+    API 키 없거나 오류 시 RSS description으로 fallback.
+    """
+    if not GEMINI_KEY:
+        return clean_desc(desc)
+
+    raw_desc = clean_desc(desc, max_len=500)
+    prompt = (
+        "아래 재생에너지 기사를 한국어로 핵심만 3줄 요약해주세요.\n"
+        "영문 기사라면 한국어로 번역해서 요약하세요.\n\n"
+        f"제목: {title}\n"
+        f"내용: {raw_desc if raw_desc else '(본문 없음 — 제목 기반으로 요약)'}\n\n"
+        "출력 형식 (이 형식만 출력, 다른 설명 없이):\n"
+        "① [핵심 내용 1 — 20자 이내]\n"
+        "② [핵심 내용 2 — 20자 이내]\n"
+        "③ [핵심 내용 3 — 20자 이내]"
+    )
+
+    payload = json.dumps({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": 150,
+            "temperature":     0.2,
+        },
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        GEMINI_URL.format(key=GEMINI_KEY),
+        data=payload,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            result = json.loads(resp.read())
+        text = result["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return text
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"  ⚠️ Gemini HTTP 오류: {e} → {body[:200]}", file=sys.stderr)
+        return clean_desc(desc)
+    except Exception as e:
+        print(f"  ⚠️ Gemini 오류: {e}", file=sys.stderr)
+        return clean_desc(desc)
+
+
 # ───────── 날짜 필터 ─────────────────────────────────────────────
 def get_lookback() -> int:
     return 72 if datetime.now(KST).weekday() == 0 else 36
@@ -145,12 +190,13 @@ def is_recent(pub_dt, cutoff) -> bool:
 
 
 # ───────── 메시지 빌드 ───────────────────────────────────────────
-def fmt_article(title: str, desc: str, link: str, tag: str) -> str:
-    """기사 1건 → 제목 + 요약 + 링크"""
+def fmt_article(title: str, summary: str, link: str, tag: str) -> str:
     lines = [f"• {tag} {title}"]
-    summary = clean_desc(desc)
     if summary:
-        lines.append(f"  ↳ {summary}")
+        for line in summary.splitlines():
+            line = line.strip()
+            if line:
+                lines.append(f"  {line}")
     if link:
         lines.append(f"  🔗 {link}")
     return "\n".join(lines)
@@ -169,25 +215,23 @@ def build_messages(kr: dict, intl: dict, lookback: int) -> list:
     ])
     footer = "━━━━━━━━━━━━━━━━━━\n출처: Google News KR · CleanTechnica · Electrek · PV Magazine"
 
-    # 카테고리별 섹션 구성
     sections = []
     for cat in CATS:
         k     = cat["key"]
         lines = [cat["label"]]
 
         items = []
-        for t, d, l in kr.get(k, []):
-            items.append(fmt_article(t, d, l, "[국내]"))
-        for t, d, l in intl.get(k, []):
-            items.append(fmt_article(t, d, l, "[해외]"))
+        for title, summary, link in kr.get(k, []):
+            items.append(fmt_article(title, summary, link, "[국내]"))
+        for title, summary, link in intl.get(k, []):
+            items.append(fmt_article(title, summary, link, "[해외]"))
 
         lines += items if items else ["• 오늘 주요 동향 없음"]
         sections.append("\n".join(lines))
 
-    # 4000자 기준으로 메시지 분할
+    # 4000자 기준 분할
     msgs    = []
     current = header + "\n\n"
-
     for sec in sections:
         candidate = current + sec + "\n\n"
         if len(candidate) > MAX_MSG and len(current) > len(header) + 5:
@@ -195,7 +239,6 @@ def build_messages(kr: dict, intl: dict, lookback: int) -> list:
             current = sec + "\n\n"
         else:
             current = candidate
-
     msgs.append((current + footer).rstrip())
     return msgs
 
@@ -209,8 +252,7 @@ def _send_once(text: str) -> bool:
     payload = json.dumps({"chat_id": CHAT_ID, "text": text}).encode("utf-8")
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data=payload,
-        method="POST",
+        data=payload, method="POST",
         headers={"Content-Type": "application/json"},
     )
     try:
@@ -237,7 +279,7 @@ def send_all(messages: list) -> bool:
         if not _send_once(msg):
             return False
         if i < total - 1:
-            time.sleep(1)   # Telegram rate limit 방지
+            time.sleep(1)
     return True
 
 
@@ -245,20 +287,21 @@ def send_all(messages: list) -> bool:
 def main():
     now = datetime.now(KST)
     print(f"[{now.strftime('%Y-%m-%d %H:%M KST')}] 재생에너지 브리핑 시작")
+    print(f"  🤖 Gemini 요약: {'활성화' if GEMINI_KEY else '비활성 (RSS fallback)'}")
 
     lookback = get_lookback()
     cutoff   = datetime.now(timezone.utc) - timedelta(hours=lookback)
     print(f"  📅 조회 기간: 최근 {lookback}시간 ({cutoff.strftime('%m/%d %H:%M UTC')} 이후)")
 
     # ── 국내 뉴스 수집 ──────────────────────────────────────────
-    kr = {}
+    kr_raw = {}
     for cat_key, url in KR_FEEDS.items():
         selected = []
         for title, pub_dt, desc, link in fetch_rss(url):
             if is_recent(pub_dt, cutoff) and len(selected) < MAX_KR:
                 selected.append((title, desc, link))
-        kr[cat_key] = selected
-    print(f"  🇰🇷 국내: {sum(len(v) for v in kr.values())}건")
+        kr_raw[cat_key] = selected
+    print(f"  🇰🇷 국내: {sum(len(v) for v in kr_raw.values())}건")
 
     # ── 해외 뉴스 수집 ──────────────────────────────────────────
     raw_intl = []
@@ -268,7 +311,6 @@ def main():
             for t, dt, d, l in fetch_rss(url)
             if is_recent(dt, cutoff)
         )
-
     seen, deduped = set(), []
     for item in raw_intl:
         key = item[0][:60]
@@ -276,17 +318,42 @@ def main():
             seen.add(key)
             deduped.append(item)
 
-    intl = {cat["key"]: [] for cat in CATS}
+    intl_raw = {cat["key"]: [] for cat in CATS}
     for t, _, d, l in deduped:
         text = t.lower()
         for cat in CATS:
             k = cat["key"]
-            if len(intl[k]) >= MAX_INTL:
+            if len(intl_raw[k]) >= MAX_INTL:
                 continue
             if any(kw in text for kw in INTL_KW[k]):
-                intl[k].append((t, d, l))
+                intl_raw[k].append((t, d, l))
                 break
-    print(f"  🌐 해외: {sum(len(v) for v in intl.values())}건")
+    print(f"  🌐 해외: {sum(len(v) for v in intl_raw.values())}건")
+
+    # ── Gemini 요약 생성 ─────────────────────────────────────────
+    print("  ✍️  Gemini 요약 생성 중...")
+    total_articles = sum(len(v) for v in kr_raw.values()) + sum(len(v) for v in intl_raw.values())
+    count = 0
+
+    kr = {}
+    for cat_key, articles in kr_raw.items():
+        kr[cat_key] = []
+        for title, desc, link in articles:
+            count += 1
+            print(f"    [{count}/{total_articles}] {title[:40]}...")
+            summary = summarize(title, desc)
+            kr[cat_key].append((title, summary, link))
+            time.sleep(0.5)   # Gemini rate limit 여유
+
+    intl = {}
+    for cat_key, articles in intl_raw.items():
+        intl[cat_key] = []
+        for title, desc, link in articles:
+            count += 1
+            print(f"    [{count}/{total_articles}] {title[:40]}...")
+            summary = summarize(title, desc)
+            intl[cat_key].append((title, summary, link))
+            time.sleep(0.5)
 
     # ── 메시지 빌드 & 전송 ──────────────────────────────────────
     messages = build_messages(kr, intl, lookback)
