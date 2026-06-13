@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-재생에너지 모닝 브리핑 - Telegram 자동 전송
-Gemini 1.5 Flash 고품질 3줄 요약 / TinyURL 단축 / 국내 70:해외 30
+재생에너지 모닝 브리핑 — Telegram 자동 전송
+- Google News 리다이렉트 → 실제 기사 URL 추출
+- Gemini 1.5 Flash 고품질 요약 (제목 반복 방지 강화)
+- TinyURL로 실제 기사 URL 단축
+- 국내 70 : 해외 30 비율
 """
 
 import os, re, sys, json, time
@@ -22,6 +25,16 @@ GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta"
     "/models/gemini-1.5-flash:generateContent?key={key}"
 )
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+}
 
 # ───────── 카테고리 ───────────────────────────────────────────────
 CATS = [
@@ -68,15 +81,13 @@ MAX_KR   = 2
 MAX_INTL = 1
 
 
-# ───────── HTML / 텍스트 유틸 ────────────────────────────────────
+# ───────── 텍스트 유틸 ───────────────────────────────────────────
 def strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
-
-def clean_text(raw: str, max_len: int = 800) -> str:
+def clean_text(raw: str, max_len: int = 500) -> str:
     t = re.sub(r"\s+", " ", strip_tags(raw)).strip()
     return (t[:max_len] + "…") if len(t) > max_len else t
-
 
 def parse_date(s: str):
     if not s:
@@ -92,44 +103,81 @@ def parse_date(s: str):
     return None
 
 
-# ───────── 기사 본문 수집 ────────────────────────────────────────
-def fetch_article_body(url: str, max_chars: int = 1000) -> str:
+# ───────── URL 처리 ──────────────────────────────────────────────
+def resolve_url(url: str) -> str:
     """
-    기사 URL → 본문 텍스트 추출.
-    Google News 리다이렉트도 자동 처리. 실패 시 빈 문자열.
+    Google News 리다이렉트 URL → 실제 기사 URL 추출.
+    ex) https://news.google.com/rss/articles/... → https://www.hankyung.com/...
+    실패 시 원본 URL 반환.
     """
     if not url:
+        return url
+    try:
+        req = urllib.request.Request(url, headers=_HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            final = resp.geturl()
+            # Google 로그인/동의 페이지면 HTML에서 canonical 찾기
+            if "google.com" in final or "accounts.google" in final:
+                html = resp.read().decode("utf-8", errors="replace")
+                # <link rel="canonical"> 또는 meta refresh
+                m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)["\']', html, re.I)
+                if m:
+                    return m.group(1)
+                m = re.search(r'content=["\']0;\s*url=([^"\']+)["\']', html, re.I)
+                if m:
+                    return m.group(1)
+                return url  # 실패
+            return final
+    except Exception:
+        return url
+
+
+def shorten_url(url: str) -> str:
+    """TinyURL로 URL 단축 (무료, API 키 불필요). 실패 시 원본 반환."""
+    if not url or len(url) < 40:
+        return url
+    try:
+        api = "https://tinyurl.com/api-create.php?" + urllib.parse.urlencode({"url": url})
+        req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            short = resp.read().decode("utf-8").strip()
+        return short if short.startswith("http") else url
+    except Exception:
+        return url
+
+
+# ───────── 기사 본문 수집 ────────────────────────────────────────
+def fetch_article_body(url: str, max_chars: int = 1200) -> str:
+    """
+    실제 기사 URL(리다이렉트 해소 후)에서 본문 텍스트 추출.
+    실패 시 빈 문자열.
+    """
+    if not url or "google.com" in url:
         return ""
     try:
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml",
-                "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            html = resp.read().decode("utf-8", errors="replace")
+        req = urllib.request.Request(url, headers=_HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw_html = resp.read()
 
-        # <article> 또는 <p> 태그에서 본문 추출
-        article_match = re.search(
-            r"<article[^>]*>(.*?)</article>", html, re.DOTALL | re.IGNORECASE
-        )
-        source = article_match.group(1) if article_match else html
+        # 인코딩 감지
+        try:
+            html = raw_html.decode("utf-8")
+        except UnicodeDecodeError:
+            html = raw_html.decode("euc-kr", errors="replace")
 
+        # <article> 영역 우선 시도
+        article_m = re.search(r"<article[^>]*>(.*?)</article>", html, re.DOTALL | re.IGNORECASE)
+        source = article_m.group(1) if article_m else html
+
+        # <p> 태그 추출
         paragraphs = re.findall(r"<p[^>]*>(.*?)</p>", source, re.DOTALL | re.IGNORECASE)
         body = " ".join(
             strip_tags(p) for p in paragraphs
-            if len(strip_tags(p)) > 40          # 짧은 캡션 제외
+            if len(strip_tags(p)) > 50        # 짧은 캡션·광고 제외
         )
         body = re.sub(r"\s+", " ", body).strip()
 
-        if len(body) < 100:
+        if len(body) < 80:
             return ""
         return (body[:max_chars] + "…") if len(body) > max_chars else body
 
@@ -139,7 +187,7 @@ def fetch_article_body(url: str, max_chars: int = 1000) -> str:
 
 # ───────── RSS 수집 ──────────────────────────────────────────────
 def fetch_rss(url: str):
-    """RSS URL → [(title, pub_dt, desc, link)]"""
+    """RSS URL → [(title, pub_dt, desc, link)] 리스트"""
     try:
         req = urllib.request.Request(
             url,
@@ -175,28 +223,27 @@ def fetch_rss(url: str):
         return []
 
 
-# ───────── URL 단축 (TinyURL) ────────────────────────────────────
-def shorten_url(url: str) -> str:
-    """TinyURL API로 URL 단축 (무료, API 키 불필요). 실패 시 원본 반환."""
-    if not url:
-        return url
-    try:
-        api = "https://tinyurl.com/api-create.php?" + urllib.parse.urlencode({"url": url})
-        req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            short = resp.read().decode("utf-8").strip()
-        return short if short.startswith("http") else url
-    except Exception:
-        return url
-
-
 # ───────── Gemini 고품질 요약 ────────────────────────────────────
+_BAD_GOOD_EXAMPLE = """
+[나쁜 예 — 절대 이렇게 하지 마세요]
+제목: "삼성SDI, 미국에 배터리 공장 건설 추진"
+  × ① 삼성SDI가 미국에 배터리 공장을 건설하려 함
+  × ② 삼성SDI의 미국 배터리 공장 추진 계획이 공개됨
+  × ③ 미국에 배터리 공장이 세워질 예정임
+
+[좋은 예 — 이렇게 작성하세요]
+  ① IRA 세액공제(최대 $35/kWh) 확보 위한 현지 생산 전략
+  ② 미 전기차 시장 성장으로 현지 조달 압박 거세져
+  ③ LG엔솔·SK온과 북미 투자 경쟁 심화, 공급과잉 리스크도
+"""
+
+
 def _call_gemini(prompt: str) -> str:
     payload = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
-            "maxOutputTokens": 200,
-            "temperature":     0.3,
+            "maxOutputTokens": 220,
+            "temperature":     0.25,
         },
     }).encode("utf-8")
 
@@ -218,22 +265,19 @@ def _call_gemini(prompt: str) -> str:
         return ""
 
 
-def summarize(title: str, desc: str, link: str) -> str:
+def summarize(title: str, desc: str, body: str) -> str:
     """
-    기사 본문 수집 → Gemini 고품질 요약.
-    본문 없으면 Gemini 배경 지식 기반 요약.
-    API 키 없거나 오류 시 RSS description fallback.
+    Gemini 고품질 요약.
+    - body(기사 본문) 있으면 → 팩트 기반 요약
+    - body 없으면 → Gemini 업계 지식 기반 분석
+    - 제목 반복 방지 규칙 엄격 적용
     """
     if not GEMINI_KEY:
-        return clean_text(desc, 120) if desc else ""
+        return clean_text(desc or body, 150)
 
-    # 1) 기사 본문 수집 시도
-    body = fetch_article_body(link)
-
-    # 2) 본문 있으면 → 팩트 기반 요약
     if body:
         prompt = f"""당신은 재생에너지 전문 애널리스트입니다.
-아래 기사 본문을 바탕으로 핵심 정보를 3줄로 요약하세요.
+아래 기사 본문을 바탕으로 3줄 핵심 요약을 작성하세요.
 
 [기사 제목]
 {title}
@@ -241,69 +285,68 @@ def summarize(title: str, desc: str, link: str) -> str:
 [기사 본문]
 {body}
 
-[요약 원칙]
-- 제목을 그대로 반복하지 말 것
-- ①은 무슨 일이 일어났는지 (구체적 사실: 회사명·수치·지역 포함)
-- ②는 규모·배경·관련 주체 등 맥락
-- ③은 업계·시장·정책에 미치는 영향 또는 의의
-- 영문 기사라면 한국어로 번역해서 작성
-- 각 줄 35자 이내, 간결하고 전문적으로
+[엄격한 작성 규칙 — 위반 시 무효]
+1. 제목 문장을 그대로 쓰거나 단어 순서·표현만 바꾸는 것 절대 금지
+2. ①은 반드시 수치·날짜·기업명·지명 등 구체적 팩트 포함
+3. ②는 이 뉴스의 배경이 되는 업계 맥락 (제목에 없는 정보)
+4. ③은 투자자·경쟁사·정책에 미치는 시사점
+5. 영문 기사라면 한국어로 번역해서 작성
+6. 각 줄 40자 이내, 간결·전문적으로
+{_BAD_GOOD_EXAMPLE}
+출력 형식만 작성 (다른 설명·문장 없이):
+① [구체적 팩트]
+② [업계 배경]
+③ [시사점]"""
 
-출력 형식만 작성 (다른 설명 없이):
-① [핵심 사실]
-② [배경·맥락]
-③ [영향·의의]"""
-
-    # 3) 본문 없으면 → Gemini 배경 지식 기반 분석
     else:
         desc_hint = clean_text(desc, 300) if desc else ""
-        prompt = f"""당신은 재생에너지 업계 전문 애널리스트입니다.
-아래 뉴스 헤드라인을 보고, 재생에너지 업계 전문 지식을 바탕으로 3줄 분석을 작성하세요.
+        prompt = f"""당신은 재생에너지 업계 수석 애널리스트입니다.
+아래 헤드라인만 보고, 업계 전문 지식을 적극 활용해 3줄 분석을 작성하세요.
 
 [뉴스 헤드라인]
 {title}
-{f'[추가 정보]{chr(10)}{desc_hint}' if desc_hint else ''}
+{f"[추가 단서]{chr(10)}{desc_hint}" if desc_hint else ""}
 
-[작성 원칙]
-- 헤드라인을 단순히 반복하지 말 것
-- ①은 이 뉴스의 핵심 사실이나 변화 (구체적으로)
-- ②는 이 뉴스가 나온 업계 배경 또는 트렌드
-- ③은 기업·투자자·정책 관점에서의 시사점
-- 불확실한 내용은 "~로 보임", "~가능성" 등으로 표현
-- 각 줄 35자 이내
-
-출력 형식만 작성 (다른 설명 없이):
-① [핵심 사실]
+[엄격한 작성 규칙 — 반드시 준수]
+1. 헤드라인 문장을 그대로 쓰거나 비슷한 말로 바꾸는 것 절대 금지
+2. 헤드라인에 이미 있는 정보(기업명·행위)를 단순 반복하는 것 금지
+3. ①은 헤드라인 이면의 핵심 — 왜(why)/얼마나(scale)/어떻게(how)
+4. ②는 이 뉴스가 나온 시장·업계 배경·트렌드 (헤드라인에 없는 맥락)
+5. ③은 투자자·기업·정책 관점의 구체적 시사점
+6. 불확실한 내용은 "~로 보임", "~가능성" 등 표현 사용
+7. 각 줄 40자 이내
+{_BAD_GOOD_EXAMPLE}
+출력 형식만 작성 (다른 설명·문장 없이):
+① [핵심 이면]
 ② [업계 배경]
 ③ [시사점]"""
 
     result = _call_gemini(prompt)
 
-    # 결과 검증: ①②③ 형식인지 확인
-    if result and "①" in result:
+    # ①②③ 형식 검증
+    if result and "①" in result and "②" in result:
         return result
-    # fallback
-    return clean_text(desc, 120) if desc else ""
+    # fallback: desc가 있으면 정제해서 반환
+    return clean_text(desc or "", 150)
 
 
 # ───────── 날짜 필터 ─────────────────────────────────────────────
 def get_lookback() -> int:
     return 72 if datetime.now(KST).weekday() == 0 else 36
 
-
 def is_recent(pub_dt, cutoff) -> bool:
     return pub_dt is None or pub_dt >= cutoff
 
 
 # ───────── 메시지 빌드 ───────────────────────────────────────────
-def fmt_article(title: str, summary: str, short_url: str, tag: str) -> str:
+def fmt_article(title: str, summary: str, url: str, tag: str) -> str:
     lines = [f"• {tag} {title}"]
     for line in (summary or "").splitlines():
         line = line.strip()
         if line:
             lines.append(f"  {line}")
-    if short_url:
-        lines.append(f"  🔗 {short_url}")
+    if url:
+        lines.append(f"  🔗 {url}")
     return "\n".join(lines)
 
 
@@ -327,12 +370,12 @@ def build_messages(kr: dict, intl: dict, lookback: int) -> list:
     for cat in CATS:
         k     = cat["key"]
         lines = [cat["label"]]
-        items = []
         for title, summary, url in kr.get(k, []):
-            items.append(fmt_article(title, summary, url, "[국내]"))
+            lines.append(fmt_article(title, summary, url, "[국내]"))
         for title, summary, url in intl.get(k, []):
-            items.append(fmt_article(title, summary, url, "[해외]"))
-        lines += items if items else ["• 오늘 주요 동향 없음"]
+            lines.append(fmt_article(title, summary, url, "[해외]"))
+        if len(lines) == 1:
+            lines.append("• 오늘 주요 동향 없음")
         sections.append("\n".join(lines))
 
     msgs, current = [], header + "\n\n"
@@ -372,7 +415,6 @@ def _send_once(text: str) -> bool:
     except Exception as e:
         print(f"❌ Telegram 전송 오류: {e}", file=sys.stderr)
         return False
-
 
 def send_all(messages: list) -> bool:
     for i, msg in enumerate(messages):
@@ -431,26 +473,45 @@ def main():
                 break
     print(f"  🌐 해외: {sum(len(v) for v in intl_raw.values())}건")
 
-    # ── Gemini 요약 + TinyURL 단축 ──────────────────────────────
-    total = (sum(len(v) for v in kr_raw.values())
-             + sum(len(v) for v in intl_raw.values()))
-    print(f"  ✍️  요약 + URL 단축 중 (총 {total}건)...")
-    count = 0
+    # ── URL 해소 + 본문 수집 + 요약 + 단축 ─────────────────────
+    all_articles = []
+    for cat_key, articles in kr_raw.items():
+        for title, desc, raw_link in articles:
+            all_articles.append(("kr", cat_key, title, desc, raw_link))
+    for cat_key, articles in intl_raw.items():
+        for title, desc, raw_link in articles:
+            all_articles.append(("intl", cat_key, title, desc, raw_link))
 
-    def process(articles):
-        nonlocal count
-        result = []
-        for title, desc, link in articles:
-            count += 1
-            print(f"    [{count}/{total}] {title[:45]}...")
-            summary   = summarize(title, desc, link)
-            short_url = shorten_url(link)
-            result.append((title, summary, short_url))
-            time.sleep(0.8)   # Gemini rate limit 여유
-        return result
+    total = len(all_articles)
+    print(f"  🔗 URL 해소 + 본문 수집 + 요약 중 (총 {total}건)...")
 
-    kr   = {k: process(v) for k, v in kr_raw.items()}
-    intl = {k: process(v) for k, v in intl_raw.items()}
+    kr   = {cat["key"]: [] for cat in CATS}
+    intl = {cat["key"]: [] for cat in CATS}
+
+    for i, (src, cat_key, title, desc, raw_link) in enumerate(all_articles, 1):
+        print(f"    [{i}/{total}] {title[:50]}...")
+
+        # 1) Google News 리다이렉트 → 실제 기사 URL
+        real_url = resolve_url(raw_link) if "google.com" in raw_link else raw_link
+        print(f"         URL: {real_url[:70]}")
+
+        # 2) 본문 수집
+        body = fetch_article_body(real_url)
+        has_body = len(body) > 80
+        print(f"         본문: {'있음 ({} chars)'.format(len(body)) if has_body else '없음 → 지식 기반 요약'}")
+
+        # 3) Gemini 요약
+        summary = summarize(title, clean_text(desc, 300), body if has_body else "")
+
+        # 4) URL 단축 (실제 기사 URL 기준)
+        short_url = shorten_url(real_url)
+
+        time.sleep(0.8)  # Gemini rate limit
+
+        if src == "kr":
+            kr[cat_key].append((title, summary, short_url))
+        else:
+            intl[cat_key].append((title, summary, short_url))
 
     # ── 메시지 빌드 & 전송 ──────────────────────────────────────
     messages = build_messages(kr, intl, lookback)
