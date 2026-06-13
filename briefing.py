@@ -183,7 +183,7 @@ def build_message(categorized: dict, lookback_hours: int) -> str:
         lines.append(f"<b>{cat['label']}</b>")
         if articles:
             for a in articles:
-            lines.append(f"• {html.escape(a)}")
+                lines.append(f"• {html.escape(a)}")
         else:
             lines.append("• 오늘 주요 동향 없음")
         lines.append("")
