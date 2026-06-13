@@ -168,18 +168,18 @@ def fetch_rss(url: str):
         return []
 
 
-# ───────── URL 단축 (TinyURL) ────────────────────────────────────
-def shorten_url(url: str) -> str:
-    if not url or len(url) < 40:
-        return url
-    try:
-        api = "https://tinyurl.com/api-create.php?" + urllib.parse.urlencode({"url": url})
-        req = urllib.request.Request(api, headers={"User-Agent": _UA})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            short = resp.read().decode("utf-8").strip()
-        return short if short.startswith("http") else url
-    except Exception:
-        return url
+# ───────── 기사 링크 ─────────────────────────────────────────────
+def article_url(link: str, title: str) -> str:
+    """
+    국내 기사: RSS 원본 링크 그대로 사용 (한 번 클릭으로 기사 이동).
+    링크가 없거나 Google 도메인이면 Naver News 검색 URL 생성.
+    해외 기사: RSS 원본 링크 그대로 사용.
+    """
+    if link and "google.com" not in link:
+        return link
+    # Naver News 검색 URL (기사 제목으로 검색 → 첫 번째 결과가 해당 기사)
+    q = urllib.parse.quote(title)
+    return f"https://search.naver.com/search.naver?where=news&query={q}"
 
 
 # ───────── Gemini 요약 ───────────────────────────────────────────
@@ -207,49 +207,77 @@ def _call_gemini(prompt: str) -> str:
 
 def summarize(title: str, body: str) -> str:
     """
-    Gemini 3줄 요약.
-    body가 충분하면(100자↑) 팩트 기반, 아니면 업계 지식 기반.
+    Gemini 신문 소제목 스타일 3줄 요약.
+    본문이 있으면 내용 기반, 없으면 업계 지식 기반.
     """
     if not GEMINI_KEY:
         return body[:120] if body else ""
 
-    has_body = len(body) > 100
+    # 본문은 400자로 제한 → 복사 방지, 합성(synthesis) 유도
+    body_excerpt = body[:400] if body else ""
+    has_body = len(body_excerpt) > 80
 
     if has_body:
-        prompt = f"""재생에너지 전문 애널리스트로서 아래 기사를 3줄로 핵심 요약하세요.
+        prompt = f"""당신은 재생에너지 전문 신문의 수석 에디터입니다.
+아래 기사를 완전히 이해한 뒤, 독자가 기사를 읽지 않아도 핵심을 파악할 수 있는
+신문 소제목 3개를 작성하세요.
 
-제목: {title}
-본문: {body}
+[기사 제목]
+{title}
 
-규칙 (반드시 준수):
-- ①: 기사에서 가장 중요한 팩트 — 수치·회사명·날짜·지역 등 구체적 정보 포함
-- ②: 이 사건의 배경 또는 원인 (제목·①에 없는 새 정보)
-- ③: 업계·시장·투자자에게 주는 시사점 또는 향후 전망
-- 제목을 그대로 반복하거나 단어만 바꾸는 것 금지
-- 영문이면 한국어로 번역해서 작성
-- 각 줄은 완결된 한 문장, 45자 이내
+[기사 본문 발췌]
+{body_excerpt}
 
-형식만 출력:
+[소제목 작성 원칙]
+① 이 기사의 핵심 사건 또는 결정 — 수치·회사명·규모를 담아 임팩트 있게
+② 배경 또는 맥락 — ①에 없는 새로운 정보 (왜 이런 일이 생겼는지)
+③ 업계 파급효과 또는 향후 전망
+
+[절대 금지]
+- 본문 문장을 그대로 옮기거나 단어만 교체하는 것
+- 기사 제목을 반복하는 것
+- "~했다", "~밝혔다" 같은 평범한 보도체 종결 (소제목처럼 끊기)
+
+[좋은 예시]
+① 한화큐셀, 美 조지아 2공장 착공…태양광 모듈 연 4GW 증설
+② 투자 1.2조·고용 2,500명, IRA 현지생산 보조금 요건 충족
+③ 美 모듈 현지화 의무 강화 속 경쟁사 대비 6개월 선점
+
+영문 기사는 한국어로 번역. 각 소제목 45자 이내.
+
+형식만 출력 (번호 포함, 다른 설명 없이):
 ①
 ②
-③ """
+③"""
+
     else:
-        prompt = f"""재생에너지 업계 수석 애널리스트로서, 아래 헤드라인이 담고 있는 이슈를 3줄로 분석하세요.
+        prompt = f"""당신은 재생에너지 전문 신문의 수석 에디터입니다.
+아래 헤드라인 하나만 보고, 업계 전문 지식을 바탕으로
+독자가 이 뉴스의 핵심을 즉시 파악할 수 있는 소제목 3개를 작성하세요.
 
-헤드라인: {title}
+[헤드라인]
+{title}
 
-규칙 (반드시 준수):
-- ①: 헤드라인이 시사하는 핵심 이슈 — 왜 이 뉴스가 중요한지 (규모·배경 포함)
-- ②: 이 이슈의 업계 배경 또는 시장 트렌드 (헤드라인에 없는 맥락)
-- ③: 기업·투자자·정책 관점의 구체적 시사점
-- 헤드라인 문장을 그대로 쓰거나 단어 순서만 바꾸는 것 절대 금지
-- 헤드라인에 이미 나온 사실을 반복하지 말 것
-- 각 줄은 완결된 한 문장, 45자 이내
+[소제목 작성 원칙]
+① 헤드라인이 담은 핵심 사건의 실질적 의미 (규모·수치·주체 포함)
+② 이 뉴스가 나온 시장·산업 배경 (헤드라인에 없는 맥락)
+③ 기업·투자자·정책 관점의 시사점 또는 향후 전망
 
-형식만 출력:
+[절대 금지]
+- 헤드라인 문장을 그대로 쓰거나 비슷한 말로 바꾸는 것
+- 헤드라인에 이미 있는 사실을 반복하는 것
+
+[좋은 예시 — 헤드라인: "삼성SDI, 미국 GM과 배터리 합작 추진"]
+① 연산 30GWh 규모…전기차 300만 대 분 공급 능력 확보
+② IRA 세액공제 최대 $35/kWh, 수익성 확보 핵심 변수
+③ LG엔솔·SK온과 북미 3파전 본격화, 과잉 투자 리스크도
+
+영문 기사는 한국어로. 각 소제목 45자 이내.
+
+형식만 출력 (번호 포함, 다른 설명 없이):
 ①
 ②
-③ """
+③"""
 
     result = _call_gemini(prompt)
     if result and "①" in result:
@@ -439,7 +467,7 @@ def main():
             all_items.append(("intl", cat_key, t, b, l))
 
     total = len(all_items)
-    print(f"  ✍️  요약 + URL 단축 중 (총 {total}건)...")
+    print(f"  ✍️  요약 중 (총 {total}건)...")
 
     kr   = {c["key"]: [] for c in CATS}
     intl = {c["key"]: [] for c in CATS}
@@ -448,14 +476,14 @@ def main():
         body_len = len(body)
         print(f"    [{i}/{total}] {title[:45]}... [본문 {body_len}자]")
 
-        summary   = summarize(title, body)
-        short_url = shorten_url(link)
+        summary  = summarize(title, body)
+        art_url  = article_url(link, title)
         time.sleep(0.8)
 
         if src == "kr":
-            kr[cat_key].append((title, summary, short_url))
+            kr[cat_key].append((title, summary, art_url))
         else:
-            intl[cat_key].append((title, summary, short_url))
+            intl[cat_key].append((title, summary, art_url))
 
     # ── 메시지 빌드 & 전송 ──────────────────────────────────────
     messages = build_messages(kr, intl, lookback)
