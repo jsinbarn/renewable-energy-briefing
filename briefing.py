@@ -17,6 +17,7 @@ import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
+import html
 
 # ───────── 설정 ─────────────────────────────────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -29,7 +30,6 @@ RSS_FEEDS = [
     "https://electrek.co/feed/",
     "https://www.pv-magazine.com/feed/",
     "https://www.renewableenergyworld.com/feed/",
-    "https://www.rechargenews.com/rss",
     "https://energymonitor.ai/feed/",
 ]
 
@@ -183,7 +183,7 @@ def build_message(categorized: dict, lookback_hours: int) -> str:
         lines.append(f"<b>{cat['label']}</b>")
         if articles:
             for a in articles:
-                lines.append(f"• {a}")
+            lines.append(f"• {html.escape(a)}")
         else:
             lines.append("• 오늘 주요 동향 없음")
         lines.append("")
