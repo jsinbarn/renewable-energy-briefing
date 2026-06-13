@@ -21,7 +21,7 @@ from email.utils import parsedate_to_datetime
 
 # ───────── 환경 변수 (앞뒤 공백 제거) ────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID   = 36488347
+CHAT_ID   = 645475613
 KST       = timezone(timedelta(hours=9))
 
 # ───────── 카테고리 정의 ──────────────────────────────────────────
