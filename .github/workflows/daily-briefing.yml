@@ -1,0 +1,27 @@
+name: 재생에너지 모닝 브리핑
+
+on:
+  schedule:
+    # 매일 23:00 UTC = 한국시간(KST) 다음날 08:00
+    # 일~목 UTC = 월~금 KST → 평일 오전 8시 전송
+    - cron: '0 23 * * 0,1,2,3,4'
+  workflow_dispatch:   # GitHub 화면에서 수동 실행 버튼
+
+jobs:
+  send-briefing:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 재생에너지 브리핑 실행
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python briefing.py
