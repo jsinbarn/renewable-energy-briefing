@@ -201,21 +201,25 @@ def send_telegram(message: str) -> bool:
         print("❌ 환경 변수 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 없음", file=sys.stderr)
         return False
 
-    data = urllib.parse.urlencode({
-        "chat_id":                  CHAT_ID,
-        "text":                     message,
-        "disable_web_page_preview": "true",
-    }).encode()
+    payload = json.dumps({
+        "chat_id": CHAT_ID,
+        "text":    message,
+    }).encode("utf-8")
 
     req = urllib.request.Request(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data=data,
+        data=payload,
         method="POST",
+        headers={"Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
         return result.get("ok", False)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"❌ Telegram 전송 오류: {e} → {body}", file=sys.stderr)
+        return False
     except Exception as e:
         print(f"❌ Telegram 전송 오류: {e}", file=sys.stderr)
         return False
