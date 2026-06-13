@@ -5,6 +5,7 @@
 GitHub Actions로 평일 오전 8시(KST) 실행
   - 월요일: 토~월 기사 (72시간)
   - 화~금:  전날~당일 기사 (36시간)
+  - 국내 70% : 해외 30% (카테고리당 국내 2건 + 해외 1건)
 """
 
 import os
@@ -12,20 +13,34 @@ import re
 import sys
 import json
 import urllib.request
-import urllib.parse
 import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
-import html
 
-# ───────── 설정 ─────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+# ───────── 환경 변수 (앞뒤 공백 제거) ────────────────────────────
+BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 KST       = timezone(timedelta(hours=9))
 
-# RSS 피드 목록
-RSS_FEEDS = [
+# ───────── 카테고리 정의 ──────────────────────────────────────────
+CATS = [
+    {"key": "solar",  "label": "☀️ 태양광 & 풍력"},
+    {"key": "batt",   "label": "🔋 에너지 저장 (ESS/배터리)"},
+    {"key": "policy", "label": "📋 정책 & 규제"},
+    {"key": "invest", "label": "💼 기업 & 투자"},
+]
+
+# ───────── 국내 뉴스: Google News 한국어 RSS (카테고리별 검색) ────
+KR_FEEDS = {
+    "solar":  "https://news.google.com/rss/search?q=태양광+풍력+재생에너지&hl=ko&gl=KR&ceid=KR:ko",
+    "batt":   "https://news.google.com/rss/search?q=배터리+ESS+에너지저장장치&hl=ko&gl=KR&ceid=KR:ko",
+    "policy": "https://news.google.com/rss/search?q=재생에너지+정책+탄소중립+RE100&hl=ko&gl=KR&ceid=KR:ko",
+    "invest": "https://news.google.com/rss/search?q=재생에너지+투자+수주+계약&hl=ko&gl=KR&ceid=KR:ko",
+}
+
+# ───────── 해외 뉴스: 전문 RSS 피드 ──────────────────────────────
+INTL_FEEDS = [
     "https://cleantechnica.com/feed/",
     "https://electrek.co/feed/",
     "https://www.pv-magazine.com/feed/",
@@ -33,176 +48,148 @@ RSS_FEEDS = [
     "https://energymonitor.ai/feed/",
 ]
 
-# 분야별 분류 키워드
-CATEGORIES = [
-    {
-        "key":      "solar_wind",
-        "label":    "☀️ 태양광 & 풍력",
-        "keywords": [
-            "solar", "wind", "photovoltaic", "pv panel", "turbine",
-            "offshore wind", "onshore wind", "rooftop solar", "floating solar",
-            "agrivoltaic", "solar farm", "wind farm", "gigawatt",
-        ],
-    },
-    {
-        "key":      "battery",
-        "label":    "🔋 에너지 저장 (ESS/배터리)",
-        "keywords": [
-            "battery", "energy storage", "ess", "bess", "lithium",
-            "lfp", "solid state battery", "grid storage", "long duration",
-            "flow battery", "sodium battery", "battery storage",
-        ],
-    },
-    {
-        "key":      "policy",
-        "label":    "📋 정책 & 규제",
-        "keywords": [
-            "policy", "regulation", "legislation", "government", "ministry",
-            "carbon", "re100", "net zero", "ira ", "inflation reduction",
-            "renewable target", "subsidy", "tariff", "green deal",
-            "carbon tax", "emission", "climate", "mandate",
-        ],
-    },
-    {
-        "key":      "investment",
-        "label":    "💼 기업 & 투자",
-        "keywords": [
-            "investment", "funding", "ipo", "acquisition", "merger",
-            "deal", "billion", "million dollar", "venture", "startup",
-            "contract", "project finance", "ppa", "offtake",
-        ],
-    },
-]
+# 해외 기사 카테고리 분류 키워드
+INTL_KW = {
+    "solar":  ["solar", "wind", "photovoltaic", "pv", "turbine",
+               "offshore wind", "onshore wind", "solar farm", "wind farm"],
+    "batt":   ["battery", "energy storage", "ess", "bess", "lithium",
+               "solid state battery", "grid storage", "long duration"],
+    "policy": ["policy", "regulation", "government", "carbon", "net zero",
+               "re100", "subsidy", "ira", "tariff", "mandate", "climate"],
+    "invest": ["investment", "funding", "ipo", "acquisition", "merger",
+               "deal", "billion", "million", "contract", "ppa", "venture"],
+}
 
-MAX_PER_CATEGORY = 3   # 분야별 최대 기사 수
+MAX_KR   = 2  # 카테고리당 국내 최대
+MAX_INTL = 1  # 카테고리당 해외 최대
 
 
-# ───────── 날짜 파싱 ──────────────────────────────────────────────────────
-def parse_pub_date(date_str: str):
-    """RSS pubDate 문자열 → datetime(tz aware). 실패 시 None."""
-    if not date_str:
+# ───────── 유틸 ──────────────────────────────────────────────────
+def strip_tags(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", text or "").strip()
+
+
+def parse_date(s: str):
+    """RFC 2822 / ISO 8601 → datetime(tz). 실패 시 None."""
+    if not s:
         return None
-    date_str = date_str.strip()
-    # RFC 2822 (Mon, 09 Jun 2025 12:00:00 +0000)
+    s = s.strip()
     try:
-        return parsedate_to_datetime(date_str)
+        return parsedate_to_datetime(s)
     except Exception:
         pass
-    # ISO 8601 (2025-06-09T12:00:00Z)
     try:
-        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
     except Exception:
         pass
     return None
 
 
-# ───────── RSS 수집 ──────────────────────────────────────────────────────
-def strip_html(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text or "").strip()
-
-
-def fetch_feed(url: str, timeout: int = 12):
-    """RSS URL → 기사 리스트 [(title, pub_date, summary)]"""
+def fetch_rss(url: str):
+    """RSS URL → [(title, pub_dt)] 목록 반환. 오류 시 빈 리스트."""
     try:
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0 (compatible; RenewableBot/1.0)"},
         )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content = resp.read()
-        root = ET.fromstring(content)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+
+        # 인코딩 자동 감지 (EUC-KR 등 대응)
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            text = raw.decode("euc-kr", errors="replace")
+            text = re.sub(r'encoding="[^"]*"', 'encoding="utf-8"', text, count=1)
+            raw  = text.encode("utf-8")
+
+        root  = ET.fromstring(raw)
         items = []
         for item in root.findall(".//item"):
-            title   = strip_html(item.findtext("title", ""))
-            pub_raw = item.findtext("pubDate") or item.findtext(
+            title = strip_tags(item.findtext("title", ""))
+            pub   = item.findtext("pubDate") or item.findtext(
                 "{http://purl.org/dc/elements/1.1/}date", ""
             )
-            pub_dt  = parse_pub_date(pub_raw)
-            desc    = strip_html(item.findtext("description", ""))[:300]
             if title:
-                items.append((title, pub_dt, desc))
+                items.append((title, parse_date(pub)))
         return items
+
     except Exception as e:
-        print(f"  ⚠️  피드 오류 [{url}]: {e}", file=sys.stderr)
+        print(f"  ⚠️ 피드 오류 [{url[:70]}]: {e}", file=sys.stderr)
         return []
 
 
-# ───────── 날짜 필터 ──────────────────────────────────────────────────────
-def get_lookback_hours() -> int:
-    """
-    월요일(KST) → 72h (토~월 커버)
-    화~금(KST) → 36h (전날~당일 커버, 약간의 여유 포함)
-    """
-    now_kst = datetime.now(KST)
-    return 72 if now_kst.weekday() == 0 else 36
+# ───────── 날짜 필터 ─────────────────────────────────────────────
+def get_lookback() -> int:
+    """월요일(KST) → 72h, 화~금 → 36h."""
+    return 72 if datetime.now(KST).weekday() == 0 else 36
 
 
-# ───────── 기사 분류 ──────────────────────────────────────────────────────
-def categorize(articles):
-    """articles: [(title, pub_date, desc)] → {category_key: [title, ...]}"""
-    result  = {cat["key"]: [] for cat in CATEGORIES}
-    used    = set()
-
-    for title, _, desc in articles:
-        text = (title + " " + desc).lower()
-        for cat in CATEGORIES:
-            if len(result[cat["key"]]) >= MAX_PER_CATEGORY:
-                continue
-            if any(kw in text for kw in cat["keywords"]):
-                key = title[:60]
-                if key not in used:
-                    result[cat["key"]].append(title)
-                    used.add(key)
-                    break   # 하나의 기사는 첫 번째 매칭 분야에만
-
-    return result
+def is_recent(pub_dt, cutoff) -> bool:
+    """pubDate 없는 기사(날짜 불명)는 포함, 있으면 cutoff 이후만."""
+    return pub_dt is None or pub_dt >= cutoff
 
 
-# ───────── 메시지 작성 ──────────────────────────────────────────────────
-def build_message(categorized: dict, lookback_hours: int) -> str:
-    now_kst = datetime.now(KST)
-    days    = ["월", "화", "수", "목", "금", "토", "일"]
-    date_str = (
-        f"{now_kst.year}년 {now_kst.month}월 {now_kst.day}일"
-        f" ({days[now_kst.weekday()]})"
-    )
-
-    # 월요일이면 "지난 주말 포함" 메모
-    period_note = "📌 주말 포함 3일치 뉴스" if lookback_hours == 72 else "📌 전일 기준 최신 뉴스"
+# ───────── 메시지 작성 ───────────────────────────────────────────
+def build_message(kr: dict, intl: dict, lookback: int) -> str:
+    now  = datetime.now(KST)
+    days = ["월", "화", "수", "목", "금", "토", "일"]
+    note = "📌 주말 포함 3일치 뉴스" if lookback == 72 else "📌 전일 기준 최신 뉴스"
 
     lines = [
         "⚡ 재생에너지 모닝 브리핑",
-        f"📅 {date_str}",
-        period_note,
+        f"📅 {now.year}년 {now.month}월 {now.day}일 ({days[now.weekday()]})",
+        note,
         "━━━━━━━━━━━━━━━━━━",
         "",
     ]
 
-    for cat in CATEGORIES:
-        articles = categorized.get(cat["key"], [])
-        lines.append(cat['label'])
+    for cat in CATS:
+        k = cat["key"]
+        lines.append(cat["label"])
+
+        articles = []
+        for t in kr.get(k, []):
+            articles.append(f"[국내] {t}")
+        for t in intl.get(k, []):
+            articles.append(f"[해외] {t}")
+
         if articles:
             for a in articles:
-                lines.append(f"• {html.escape(a)}")
+                lines.append(f"• {a}")
         else:
             lines.append("• 오늘 주요 동향 없음")
         lines.append("")
 
     lines += [
         "━━━━━━━━━━━━━━━━━━",
-        "🌐 CleanTechnica · Electrek · PV Magazine · REWorld",
+        "출처: Google News KR · CleanTechnica · Electrek · PV Magazine",
     ]
     return "\n".join(lines)
 
 
-# ───────── Telegram 전송 ──────────────────────────────────────────────────
+# ───────── Telegram 전송 ─────────────────────────────────────────
 def send_telegram(message: str) -> bool:
-    if not BOT_TOKEN or not CHAT_ID:
-        print("❌ 환경 변수 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 없음", file=sys.stderr)
+    # 시크릿 검증
+    if not BOT_TOKEN:
+        print("❌ TELEGRAM_BOT_TOKEN 없음", file=sys.stderr)
+        return False
+    if not CHAT_ID:
+        print("❌ TELEGRAM_CHAT_ID 없음", file=sys.stderr)
         return False
 
+    # Chat ID 숫자 변환
+    try:
+        chat_id_int = int(CHAT_ID)
+    except ValueError:
+        print(f"❌ CHAT_ID가 숫자가 아님: '{CHAT_ID}'", file=sys.stderr)
+        return False
+
+    print(f"  🔑 Token: ...{BOT_TOKEN[-8:]}")
+    print(f"  🔑 Chat ID: {chat_id_int}")
+
     payload = json.dumps({
-        "chat_id": int(CHAT_ID),
+        "chat_id": chat_id_int,
         "text":    message,
     }).encode("utf-8")
 
@@ -215,54 +202,68 @@ def send_telegram(message: str) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
             result = json.loads(resp.read())
-        return result.get("ok", False)
+        if result.get("ok"):
+            return True
+        print(f"❌ Telegram 응답 오류: {result}", file=sys.stderr)
+        return False
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        print(f"❌ Telegram 전송 오류: {e} → {body}", file=sys.stderr)
+        print(f"❌ Telegram HTTP 오류: {e} → {body}", file=sys.stderr)
         return False
     except Exception as e:
         print(f"❌ Telegram 전송 오류: {e}", file=sys.stderr)
         return False
 
 
-# ───────── 메인 ──────────────────────────────────────────────────────────
+# ───────── 메인 ──────────────────────────────────────────────────
 def main():
-    now_kst = datetime.now(KST)
-    print(f"[{now_kst.strftime('%Y-%m-%d %H:%M KST')}] 재생에너지 브리핑 시작")
+    now = datetime.now(KST)
+    print(f"[{now.strftime('%Y-%m-%d %H:%M KST')}] 재생에너지 브리핑 시작")
 
-    # 1. 조회 기간 결정
-    lookback_hours = get_lookback_hours()
-    cutoff         = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    print(f"  📅 조회 기간: 최근 {lookback_hours}시간 ({cutoff.strftime('%m/%d %H:%M UTC')} 이후)")
+    lookback = get_lookback()
+    cutoff   = datetime.now(timezone.utc) - timedelta(hours=lookback)
+    print(f"  📅 조회 기간: 최근 {lookback}시간 ({cutoff.strftime('%m/%d %H:%M UTC')} 이후)")
 
-    # 2. RSS 수집 + 날짜 필터
-    all_articles = []
-    for url in RSS_FEEDS:
-        items = fetch_feed(url)
-        for title, pub_dt, desc in items:
-            # pubDate 없는 기사는 포함 (날짜 불명확하면 일단 포함)
-            if pub_dt is None or pub_dt >= cutoff:
-                all_articles.append((title, pub_dt, desc))
-    print(f"  → {len(all_articles)}개 기사 수집")
+    # ── 국내 뉴스 (카테고리별 Google News 검색) ──────────────────
+    kr = {}
+    for cat_key, url in KR_FEEDS.items():
+        arts = fetch_rss(url)
+        kr[cat_key] = [t for t, dt in arts if is_recent(dt, cutoff)][:MAX_KR]
+    print(f"  🇰🇷 국내: {sum(len(v) for v in kr.values())}건")
 
-    # 중복 제목 제거
-    seen, unique = set(), []
-    for item in all_articles:
-        key = item[0][:60]
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-    print(f"  → 중복 제거 후 {len(unique)}개")
+    # ── 해외 뉴스 (전문 RSS → 키워드 분류) ──────────────────────
+    raw_intl = []
+    for url in INTL_FEEDS:
+        raw_intl.extend(
+            (t, dt) for t, dt in fetch_rss(url) if is_recent(dt, cutoff)
+        )
 
-    # 3. 분류
-    categorized = categorize(unique)
+    # 중복 제거
+    seen, deduped = set(), []
+    for t, dt in raw_intl:
+        k = t[:60]
+        if k not in seen:
+            seen.add(k)
+            deduped.append((t, dt))
 
-    # 4. 메시지 작성 & 전송
-    message = build_message(categorized, lookback_hours)
-    print(f"  📨 전송 중 ({len(message)}자)")
+    intl = {cat["key"]: [] for cat in CATS}
+    for t, _ in deduped:
+        text = t.lower()
+        for cat in CATS:
+            k = cat["key"]
+            if len(intl[k]) >= MAX_INTL:
+                continue
+            if any(kw in text for kw in INTL_KW[k]):
+                intl[k].append(t)
+                break
+    print(f"  🌐 해외: {sum(len(v) for v in intl.values())}건")
+
+    # ── 메시지 작성 & 전송 ───────────────────────────────────────
+    message = build_message(kr, intl, lookback)
+    print(f"  📨 전송 중 ({len(message)}자)...")
 
     if send_telegram(message):
-        print("  ✅ 텔레그램 전송 성공")
+        print("  ✅ 텔레그램 전송 성공!")
     else:
         print("  ❌ 텔레그램 전송 실패")
         sys.exit(1)
