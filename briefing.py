@@ -14,13 +14,14 @@ import sys
 import json
 import urllib.request
 import urllib.error
+import urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
 # ───────── 환경 변수 (앞뒤 공백 제거) ────────────────────────────
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+CHAT_ID   = 36488347
 KST       = timezone(timedelta(hours=9))
 
 # ───────── 카테고리 정의 ──────────────────────────────────────────
@@ -32,11 +33,16 @@ CATS = [
 ]
 
 # ───────── 국내 뉴스: Google News 한국어 RSS (카테고리별 검색) ────
+def _gnews(q):
+    return "https://news.google.com/rss/search?" + urllib.parse.urlencode(
+        {"q": q, "hl": "ko", "gl": "KR", "ceid": "KR:ko"}
+    )
+
 KR_FEEDS = {
-    "solar":  "https://news.google.com/rss/search?q=태양광+풍력+재생에너지&hl=ko&gl=KR&ceid=KR:ko",
-    "batt":   "https://news.google.com/rss/search?q=배터리+ESS+에너지저장장치&hl=ko&gl=KR&ceid=KR:ko",
-    "policy": "https://news.google.com/rss/search?q=재생에너지+정책+탄소중립+RE100&hl=ko&gl=KR&ceid=KR:ko",
-    "invest": "https://news.google.com/rss/search?q=재생에너지+투자+수주+계약&hl=ko&gl=KR&ceid=KR:ko",
+    "solar":  _gnews("태양광 풍력 재생에너지"),
+    "batt":   _gnews("배터리 ESS 에너지저장장치"),
+    "policy": _gnews("재생에너지 정책 탄소중립 RE100"),
+    "invest": _gnews("재생에너지 투자 수주 계약"),
 }
 
 # ───────── 해외 뉴스: 전문 RSS 피드 ──────────────────────────────
@@ -179,17 +185,11 @@ def send_telegram(message: str) -> bool:
         return False
 
     # Chat ID 숫자 변환
-    try:
-        chat_id_int = int(CHAT_ID)
-    except ValueError:
-        print(f"❌ CHAT_ID가 숫자가 아님: '{CHAT_ID}'", file=sys.stderr)
-        return False
-
     print(f"  🔑 Token: ...{BOT_TOKEN[-8:]}")
-    print(f"  🔑 Chat ID: {chat_id_int}")
+    print(f"  🔑 Chat ID: {CHAT_ID}")
 
     payload = json.dumps({
-        "chat_id": chat_id_int,
+        "chat_id": CHAT_ID,
         "text":    message,
     }).encode("utf-8")
 
